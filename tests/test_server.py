@@ -438,6 +438,8 @@ def test_reports_and_export(c, org):
     assert r["audit"]["ok"] and "support-bot" in server.digest_text(r)
     csv_text = c.get("/v1/audit/export.csv", headers=org["viewer"]).text
     assert "VERIFIED" in csv_text.splitlines()[0] and "support-bot" in csv_text
+    jsonl_text = c.get("/v1/audit/export.jsonl", headers=org["viewer"]).text
+    assert "support-bot" in jsonl_text and len(jsonl_text.splitlines()) > 0
 
 
 def test_one_tap_links(c, org):

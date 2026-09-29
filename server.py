@@ -1604,6 +1604,28 @@ def audit_export(days: int = Query(30, ge=1, le=3650), who: str = Depends(person
         "Content-Disposition": f'attachment; filename="squidbrake-audit-{datetime.now():%Y%m%d}.csv"'})
 
 
+@app.get("/v1/audit/export.jsonl")
+def audit_export_jsonl(days: int = Query(30, ge=1, le=3650), who: str = Depends(person)):
+    import json, io
+    since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
+    buf = io.StringIO()
+
+    def serialize(v):
+        if isinstance(v, datetime):
+            return v.isoformat().replace("+00:00", "Z")
+        return v
+
+    with engine.connect() as conn:
+        for r in conn.execute(select(*[events.c[c] for c in EXPORT_COLUMNS]).where(events.c.created_at >= since)
+                              .order_by(events.c.created_at)):
+            row_dict = {c: serialize(v) for c, v in zip(EXPORT_COLUMNS, r)}
+            buf.write(json.dumps(row_dict) + "\n")
+    with audited_tx() as conn:
+        audit(conn, who, "audit.exported.jsonl", None, days=days)
+    return Response(buf.getvalue(), media_type="application/jsonl", headers={
+        "Content-Disposition": f'attachment; filename="squidbrake-audit-{datetime.now():%Y%m%d}.jsonl"'})
+
+
 @app.post("/v1/policy/check")
 def policy_check(ev: EventIn, client: str = Depends(auth)):
     """Dry run: what would the rules decide? Nothing is recorded."""
