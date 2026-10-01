@@ -7,7 +7,9 @@ through Squidbrake before it runs, and reports the result afterwards.
   held for approval       -> Claude Code waits (up to ~9 minutes) until someone approves / rejects it
                              in the dashboard
 
-Install it with:  python connect.py claude-code
+It also records what you ask (UserPromptSubmit), so the gateway can tell addresses you gave from ones a web page gave.
+
+Install it with:  python connect.py claude-code   (or the Claude Code plugin: see plugin/README.md)
 Settings (env vars, set by connect.py in the hook command):
   GATEWAY_URL, GATEWAY_API_KEY, GATEWAY_SOURCE (default "claude-code"),
   GATEWAY_FAIL_OPEN=1 to let calls run when the gateway is unreachable (default: block them)
@@ -25,9 +27,11 @@ import httpx
 
 def _arg(flag: str, env: str, default: str) -> str:
     # Claude Code hook config has no env field, so connect.py passes settings as arguments.
+    # Installed as a Claude Code plugin, they come from the plugin's settings instead.
     if flag in sys.argv[1:-1]:
         return sys.argv[sys.argv.index(flag) + 1]
-    return os.getenv(env, default)
+    plugin_option = {"GATEWAY_URL": "CLAUDE_PLUGIN_OPTION_GATEWAY_URL", "GATEWAY_API_KEY": "CLAUDE_PLUGIN_OPTION_API_KEY"}.get(env)
+    return os.getenv(env) or (plugin_option and os.getenv(plugin_option)) or default
 
 
 GATEWAY_URL = _arg("--url", "GATEWAY_URL", "http://localhost:8080").rstrip("/")
@@ -40,9 +44,13 @@ SKIP_PREFIXES = ("mcp__gateway-db__", "mcp__gw-")
 STATE_DIR = Path(tempfile.gettempdir()) / "squidbrake-hook"
 
 
-def deny(reason: str) -> None:
-    print(json.dumps({"hookSpecificOutput": {
-        "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}))
+def deny(reason: str, stop: bool = False) -> None:
+    """Refuse this tool call. stop=True also ends Claude's turn (the agent or its session was stopped)."""
+    out: dict = {"hookSpecificOutput": {
+        "hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": reason}}
+    if stop:
+        out.update({"continue": False, "stopReason": reason})
+    print(json.dumps(out))
     sys.exit(0)
 
 
@@ -78,10 +86,12 @@ def pre(ev: dict, http: httpx.Client) -> None:
         deny("Squidbrake: nobody approved this in time. Ask the user to approve it in the dashboard, then try again.")
     if d["decision"] == "deny":
         by = d.get("decided_by")
+        if d.get("rule_id") in ("emergency-stop", "session-stop") or                 (d.get("decision_note") or "").startswith("The session was stopped"):
+            deny(f"Squidbrake: {d.get('decision_note') or d.get('reason')}. Stop working and tell the user.", stop=True)
         if by and by != "timeout":
             note = f' Note: "{d["decision_note"]}".' if d.get("decision_note") else ""
             deny(f"Squidbrake: rejected by {by}.{note} Don't retry it; ask the user how to proceed.")
-        deny(f"Squidbrake blocked this (rule '{d.get('rule_id')}'): {d.get('reason')}. Don't try to work around it.")
+        deny(f"Squidbrake blocked this (rule '{d.get('rule_id')}'): {(d.get('reason') or '').rstrip('.')}. Don't try to work around it.")
 
     # Allowed: remember the event so PostToolUse can attach the result, then let Claude Code continue normally.
     if ev.get("tool_use_id"):
@@ -89,17 +99,34 @@ def pre(ev: dict, http: httpx.Client) -> None:
         (STATE_DIR / f"{ev['tool_use_id']}.json").write_text(json.dumps({"event_id": d["event_id"], "t0": time.time()}))
 
 
-def post(ev: dict, http: httpx.Client) -> None:
+def post(ev: dict, http: httpx.Client, failed: bool = False) -> None:
+    """PostToolUse: attach the result. PostToolUseFailure (the tool errored, e.g. a command exited non-zero): the error."""
     f = STATE_DIR / f"{ev.get('tool_use_id')}.json"
     if not f.exists():
         return
     state = json.loads(f.read_text())
     f.unlink(missing_ok=True)
+    result = {"duration_ms": (time.time() - state["t0"]) * 1000}
+    if failed:
+        result["error"] = str(ev.get("error") or "the tool failed")[:2000]
+    else:
+        result["output"] = ev.get("tool_response")
     try:
-        http.post(f"/v1/events/{state['event_id']}/result", json={
-            "output": ev.get("tool_response"), "duration_ms": (time.time() - state["t0"]) * 1000})
+        http.post(f"/v1/events/{state['event_id']}/result", json=result)
     except httpx.HTTPError:
         pass  # the tool already ran; never fail Claude Code because reporting failed
+
+
+def prompt(ev: dict, http: httpx.Client) -> None:
+    """Record what the user asked. Never blocks the prompt: if the gateway is down, Claude Code carries on."""
+    text = ev.get("prompt")
+    if not text:
+        return
+    try:
+        http.post("/v1/events", json={"name": "user.prompt", "kind": "prompt", "input": {"prompt": text},
+                                      "output": {"recorded": True}, "source": SOURCE, "session_id": ev.get("session_id")})
+    except httpx.HTTPError:
+        pass
 
 
 def main() -> None:
@@ -114,6 +141,10 @@ def main() -> None:
             pre(ev, http)
         elif ev.get("hook_event_name") == "PostToolUse":
             post(ev, http)
+        elif ev.get("hook_event_name") == "PostToolUseFailure":
+            post(ev, http, failed=True)
+        elif ev.get("hook_event_name") == "UserPromptSubmit":
+            prompt(ev, http)
     sys.exit(0)
 
 

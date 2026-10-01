@@ -55,25 +55,43 @@ from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from pydantic import BaseModel, Field
 from sqlalchemy import (
     Column, Float, Integer, MetaData, String, Table, Text, case, create_engine, delete, event as sa_event,
-    and_, func, inspect as sa_inspect, or_, select, text, update,
+    and_, func, inspect as sa_inspect, or_, select, text, true, update,
 )
+
+import commands
+import taint
+import verify
 
 # --------------------------------------------------------------------------- config
 
-# Every setting is optional. A .env file next to this one is picked up automatically.
+# Defaults live next to this file, so it doesn't matter which folder you start it from.
+# Installed with pip (the package has an __init__.py), they live in ~/.squidbrake instead.
+BASE_DIR = Path(__file__).resolve().parent
+HOME_DIR = Path(os.getenv("SQUIDBRAKE_HOME") or
+                (Path.home() / ".squidbrake" if (BASE_DIR / "__init__.py").exists() else BASE_DIR))
+
+# Every setting is optional. A .env file there is picked up automatically.
 try:
     from dotenv import load_dotenv
-    load_dotenv(Path(__file__).with_name(".env"))
+    load_dotenv(HOME_DIR / ".env")
 except ImportError:
     pass
 
-# Defaults live next to this file, so it doesn't matter which folder you start it from.
-BASE_DIR = Path(__file__).resolve().parent
-DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{(BASE_DIR / 'data' / 'gateway.db').as_posix()}")
-KEYS_PATH = Path(os.getenv("KEYS_PATH", BASE_DIR / "data" / "keys.json"))
+
+def _default_rules() -> Path:
+    """rules.yaml in HOME_DIR; a pip install starts from a copy of the shipped one, which you then edit."""
+    path = HOME_DIR / "rules.yaml"
+    if not path.exists() and (BASE_DIR / "rules.yaml").exists() and HOME_DIR != BASE_DIR:
+        HOME_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_bytes((BASE_DIR / "rules.yaml").read_bytes())
+    return path
+
+
+DATABASE_URL = os.getenv("DATABASE_URL", f"sqlite:///{(HOME_DIR / 'data' / 'gateway.db').as_posix()}")
+KEYS_PATH = Path(os.getenv("KEYS_PATH", HOME_DIR / "data" / "keys.json"))
 AUTH_DISABLED = os.getenv("GATEWAY_AUTH", "on").strip().lower() in ("off", "disabled", "false", "0", "no")
 IN_DOCKER = bool(os.getenv("IN_DOCKER"))
-RULES_PATH = Path(os.getenv("RULES_PATH", BASE_DIR / "rules.yaml"))
+RULES_PATH = Path(os.getenv("RULES_PATH") or _default_rules())
 MAX_PAYLOAD_CHARS = int(os.getenv("MAX_PAYLOAD_CHARS", "65536"))
 RETENTION_DAYS = int(os.getenv("RETENTION_DAYS", "0"))  # 0 = keep forever
 PROXY_TIMEOUT = float(os.getenv("PROXY_TIMEOUT", "60"))
@@ -111,6 +129,16 @@ def _hash(secret: str) -> str:
     return hashlib.sha256(secret.encode()).hexdigest()
 
 
+def _file_sig(path: Path) -> tuple[int, int, int] | None:
+    """What a hot-reloaded file's reload is keyed on; None if it's missing. mtime alone misses a second write
+    in the same clock tick (common on Windows), so size and inode (new on every os.replace) count too."""
+    try:
+        st = path.stat()
+    except FileNotFoundError:
+        return None
+    return st.st_mtime_ns, st.st_size, st.st_ino
+
+
 class KeyStore:
     """Who may call the gateway, and who may approve.
 
@@ -126,7 +154,7 @@ class KeyStore:
         self.path, self.disabled = path, disabled
         self.from_env = bool(env_keys.strip())
         self._lock = threading.Lock()
-        self._mtime: float | None = -1.0
+        self._sig: tuple | None = ()  # never equal to a real signature or None
         self._by_hash: dict[str, str] = {}
         self._info: dict[str, dict] = {}
         self.approvers: set[str] = set()
@@ -153,11 +181,8 @@ class KeyStore:
     def _maybe_reload(self) -> None:
         if self.from_env or self.disabled:
             return
-        try:
-            mtime = self.path.stat().st_mtime
-        except FileNotFoundError:
-            mtime = None
-        if mtime == self._mtime:
+        sig = _file_sig(self.path)
+        if sig == self._sig:
             return
         with self._lock:
             try:
@@ -167,7 +192,7 @@ class KeyStore:
                 self.approvers = {name for name, i in self._info.items() if i["approver"]}
             except Exception:
                 log.exception("failed to read %s, keeping previous keys", self.path)
-            self._mtime = mtime
+            self._sig = sig
 
     def identify(self, secret: str) -> str | None:
         if self.disabled:
@@ -347,6 +372,7 @@ events = Table(
     Column("decided_at", String(32)),
     Column("decision_note", Text),
     Column("signals", Text),                        # JSON list of history-check findings (see history_signals)
+    Column("would", String(10)),                    # shadow mode: what would have happened (deny | review), then allowed
 )
 
 # Small key/value store for state all workers share: the emergency stop and notification settings.
@@ -369,7 +395,15 @@ audit_trail = Table(
     Column("prev_hash", String(64), nullable=False, unique=True),  # a fork can't be written silently
     Column("hash", String(64), nullable=False),
 )
-GENESIS = "0" * 64
+GENESIS = verify.GENESIS
+
+# Every version of rules.yaml that made a decision, so any decision can be traced to the exact rules behind it.
+policy_versions = Table(
+    "policy_versions", metadata,
+    Column("fingerprint", String(16), primary_key=True),
+    Column("first_seen", String(32), nullable=False),
+    Column("content", Text, nullable=False),
+)
 
 
 def migrate(eng) -> None:
@@ -410,9 +444,7 @@ def _sha(obj: Any) -> str | None:
     return None if obj is None else hashlib.sha256(str(obj).encode()).hexdigest()
 
 
-def _entry_hash(prev: str, at: str, actor: str | None, action: str, target: str | None, detail: str) -> str:
-    body = json.dumps([prev, at, actor, action, target, detail], separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(body.encode()).hexdigest()
+_entry_hash = verify.entry_hash   # one definition, shared with the offline checker
 
 
 def audit(conn, actor: str | None, action: str, target: str | None, **detail) -> None:
@@ -424,16 +456,18 @@ def audit(conn, actor: str | None, action: str, target: str | None, **detail) ->
 
 
 def verify_audit_chain() -> dict:
-    prev, n = GENESIS, 0
+    """The hash chain, plus: do the recorded actions still match the fingerprints taken when they happened?"""
     with engine.connect() as conn:
-        for r in conn.execute(select(audit_trail).order_by(audit_trail.c.seq)).all():
-            n += 1
-            if r.prev_hash != prev or r.hash != _entry_hash(prev, r.at, r.actor, r.action, r.target, r.detail):
-                return {"ok": False, "entries": n, "first_bad_seq": r.seq, "head_hash": None,
-                        "message": f"entry #{r.seq} was changed, removed or inserted after the fact"}
-            prev = r.hash
-    return {"ok": True, "entries": n, "first_bad_seq": None, "head_hash": prev,
-            "message": "every entry is intact and in its original order"}
+        entries = [dict(r._mapping) for r in conn.execute(select(audit_trail).order_by(audit_trail.c.seq)).all()]
+        rows = {r.id: {"id": r.id, "input": r.input, "output": r.output}
+                for r in conn.execute(select(events.c.id, events.c.input, events.c.output)).all()}
+    result = verify.check_chain(entries)
+    changed = verify.check_events(entries, rows)["changed"] if result["ok"] else []
+    if changed:
+        result.update(ok=False, head_hash=result["head_hash"], events_changed=changed,
+                      message=f"the chain is intact, but {len(changed)} recorded action(s) were edited in the database "
+                              f"afterwards (first: {changed[0]['event']}, {changed[0]['field']})")
+    return result
 
 
 def state_get(key: str, default: Any = None) -> Any:
@@ -492,6 +526,33 @@ HISTORY_DEFAULTS = {
     "duplicate_change": "review",           # the same change on the same target again (e.g. a 2nd refund)
 }
 
+# Taint checks (rules.yaml `taint_checks:`): where is this action sending things, and did that come from content
+# someone else wrote (a web page, an email, an issue) rather than from the user or the company's own systems?
+TAINT_EFFECT_KEYS = ("untrusted_destination", "after_untrusted")
+TAINT_DEFAULTS = {
+    "untrusted": ["WebFetch", "WebSearch", "*fetch*", "*browse*", "*scrape*", "*crawl*", "*web_search*", "*search_web*",
+                  "*inbox*", "*read_email*", "*email_read*", "*get_email*", "*mail*read*", "*read*mail*", "*get_message*",
+                  "*read_message*", "*message_read*", "*issue*", "*ticket*", "*comment*", "*pull_request*",
+                  "*channel*history*", "*conversations*history*", "*download*", "*http_get*"],
+    "sinks": ["*send*", "*reply*", "*forward*", "*_post*", "*post_*", "*.post*", "*publish*", "*add_comment*",
+              "*create_comment*", "*comment_create*", "*create_issue*", "*issue_create*", "*create_pull*",
+              "*pull_request_create*", "*pr_create*", "*transfer*", "*wire*", "*payout*", "*refund*", "*payment*create*",
+              "*webhook*", "*upload*", "*share*", "*invite*", "*http_request*"],
+    "lookback_hours": 24,
+    "untrusted_destination": "review",  # sends to an address/URL/account found only in untrusted content
+    "after_untrusted": "warn",          # sends anything out after untrusted content was read in this conversation
+}
+
+# Command checks (rules.yaml `command_checks:`) read what a shell command actually does (see commands.py).
+COMMAND_EFFECT_KEYS = ("catastrophic", "irreversible", "hidden")
+COMMAND_DEFAULTS = {
+    "tools": ["Bash", "PowerShell", "*shell*", "*run_command*", "*execute_command*", "*terminal*", "*exec_command*"],
+    "catastrophic": "block",   # wipes a disk, the filesystem or a home folder: rm -rf /, rm -rf ~, mkfs, dd onto a disk
+    "irreversible": "review",  # rm -r, git push --force, git reset --hard, terraform destroy, kubectl delete, DROP TABLE
+    "hidden": "review",        # code that can't be read first: eval, curl | sh, base64 -d | bash, -EncodedCommand
+    "read_only": "off",        # "allow": commands that only look (ls, cat, grep, git status) run without asking
+}
+
 
 class Policy:
     """rules.yaml, hot-reloaded whenever the file changes. First matching rule wins."""
@@ -535,28 +596,78 @@ class Policy:
             return None
         return n if n == n else None  # NaN never matches
 
+    @classmethod
+    def _compile_match(cls, m: dict) -> dict:
+        return {
+            "globs": {f: ([m[f]] if isinstance(m[f], str) else list(m[f])) for f in cls.MATCH_FIELDS if f in m},
+            "input_regex": re.compile(m["input_regex"], re.I | re.S) if m.get("input_regex") else None,
+            "input_conds": cls._input_conds(m.get("input")),
+        }
+
+    @classmethod
+    def matches(cls, compiled: dict, values: dict, input: Any, input_text: str | None = None) -> bool:
+        if not all(any(fnmatch.fnmatchcase((values.get(f) or "").lower(), p.lower()) for p in pats)
+                   for f, pats in compiled["globs"].items()):
+            return False
+        if compiled["input_regex"] is not None:
+            if input_text is None:
+                input_text = input if isinstance(input, str) else json.dumps(input, default=str, ensure_ascii=False)
+            if not compiled["input_regex"].search(input_text):
+                return False
+        # A missing or non-numeric field never matches, so the call falls through to later rules.
+        return all((n := cls._input_number(input, f)) is not None and op(n, v) for f, op, v in compiled["input_conds"])
+
+    @classmethod
+    def _compile_sequences(cls, items: list) -> list[dict]:
+        out = []
+        for i, r in enumerate(items or []):
+            rid = r.get("id") or f"sequence-{i}"
+            action = r.get("action", "review")
+            if action not in ("deny", "review", "warn"):
+                raise ValueError(f"sequences.{rid}: action must be deny, review or warn")
+            after, count = r.get("after"), r.get("count")
+            if not after and not count:
+                raise ValueError(f"sequences.{rid}: needs `after:` or `count:`")
+            seq = {"id": rid, "action": action, "reason": r.get("reason") or rid,
+                   "match": cls._compile_match(r.get("match") or {}), "after": None, "count": None}
+            if after:
+                seq["after"] = {"match": cls._compile_match(after.get("match") or {}),
+                                "within_hours": float(after.get("within_hours", 24)),
+                                "same_target": bool(after.get("same_target", False))}
+            if count:
+                scope = count.get("scope", "agent")
+                if scope not in ("session", "agent", "all") or "more_than" not in count:
+                    raise ValueError(f"sequences.{rid}: count needs more_than, and scope session | agent | all")
+                seq["count"] = {"more_than": int(count["more_than"]), "within_hours": float(count.get("within_hours", 1)),
+                                "scope": scope}
+            out.append(seq)
+        return out
+
     def __init__(self, path: Path):
         self.path = path
-        self._mtime: float | None = -1.0
+        self._sig: tuple | None = ()  # never equal to a real signature or None
         self._lock = threading.Lock()
         self.default = "allow"
         self.default_reason = "default allow"
         self.rules: list[dict] = []
         self.history: dict = dict(HISTORY_DEFAULTS)
+        self.commands: dict = dict(COMMAND_DEFAULTS)
+        self.taint: dict = dict(TAINT_DEFAULTS)
+        self.sequences: list[dict] = []
+        self.source, self.fingerprint = "", verify.rules_fingerprint("")
+        self.mode, self.shadow_agents = "enforce", []
         self.upstreams: dict[str, str] = {}
 
     def _maybe_reload(self) -> None:
-        try:
-            mtime = self.path.stat().st_mtime
-        except FileNotFoundError:
-            mtime = None
-        if mtime == self._mtime:
+        sig = _file_sig(self.path)
+        if sig == self._sig:
             return
         with self._lock:
-            if mtime == self._mtime:
+            if sig == self._sig:
                 return
             try:
-                data = (yaml.safe_load(self.path.read_text(encoding="utf-8")) if mtime else None) or {}
+                source = self.path.read_text(encoding="utf-8") if sig else ""
+                data = yaml.safe_load(source) or {}
                 rules = []
                 for i, r in enumerate(data.get("rules") or []):
                     m = r.get("match") or {}
@@ -565,9 +676,7 @@ class Policy:
                         "id": r.get("id") or f"rule-{i}",
                         "action": r.get("action", "deny"),
                         "reason": r.get("reason", ""),
-                        "globs": {f: ([m[f]] if isinstance(m[f], str) else list(m[f])) for f in self.MATCH_FIELDS if f in m},
-                        "input_regex": re.compile(m["input_regex"], re.I | re.S) if m.get("input_regex") else None,
-                        "input_conds": self._input_conds(m.get("input")),
+                        **self._compile_match(m),
                         # review-only options
                         "timeout_seconds": int(r.get("timeout_seconds", APPROVAL_TIMEOUT)),
                         "on_timeout": r.get("on_timeout", "deny"),
@@ -585,38 +694,59 @@ class Policy:
                     if hc[k] not in ("block", "review", "warn", "off"):
                         raise ValueError(f"history_checks.{k} must be block, review, warn or off")
                 hc["company_domains"] = [d.lower().strip() for d in hc["company_domains"] or []]
-                self.default, self.rules, self.history = default, rules, hc
+                cc = {**COMMAND_DEFAULTS, **(data.get("command_checks") or {})}
+                for k in COMMAND_EFFECT_KEYS:
+                    cc[k] = "off" if cc[k] is False else COMMAND_DEFAULTS[k] if cc[k] is True else str(cc[k]).lower()
+                    if cc[k] not in ("block", "review", "warn", "off"):
+                        raise ValueError(f"command_checks.{k} must be block, review, warn or off")
+                cc["read_only"] = "off" if cc["read_only"] is False else "allow" if cc["read_only"] is True \
+                    else str(cc["read_only"]).lower()
+                if cc["read_only"] not in ("allow", "off"):
+                    raise ValueError("command_checks.read_only must be allow or off")
+                cc["tools"] = [cc["tools"]] if isinstance(cc["tools"], str) else list(cc["tools"] or [])
+                sequences = self._compile_sequences(data.get("sequences"))
+                tc = {**TAINT_DEFAULTS, **(data.get("taint_checks") or {})}
+                for k in TAINT_EFFECT_KEYS:
+                    tc[k] = "off" if tc[k] is False else TAINT_DEFAULTS[k] if tc[k] is True else str(tc[k]).lower()
+                    if tc[k] not in ("block", "review", "warn", "off"):
+                        raise ValueError(f"taint_checks.{k} must be block, review, warn or off")
+                for k in ("untrusted", "sinks"):
+                    tc[k] = [tc[k]] if isinstance(tc[k], str) else list(tc[k] or [])
+                mode = str(data.get("mode", "enforce")).lower()
+                if mode not in ("enforce", "shadow"):
+                    raise ValueError("mode must be enforce or shadow")
+                shadow_agents = data.get("shadow_agents") or []
+                shadow_agents = [shadow_agents] if isinstance(shadow_agents, str) else list(shadow_agents)
+                self.default, self.rules, self.history, self.commands = default, rules, hc, cc
+                self.sequences, self.taint = sequences, tc
+                self.source, self.fingerprint = source, verify.rules_fingerprint(source)
+                self.mode, self.shadow_agents = mode, shadow_agents
                 self.default_reason = data.get("default_reason") or f"default {default}"
                 self.upstreams = {k: str(v).rstrip("/") for k, v in (data.get("upstreams") or {}).items()}
                 log.info("loaded %d rules from %s (default=%s)", len(rules), self.path, default)
             except Exception:
                 # A broken edit must never take the gateway down: keep serving the last good rules.
                 log.exception("failed to load %s, keeping previous rules", self.path)
-            self._mtime = mtime
+            self._sig = sig
 
     DEFAULT_RULE = {"timeout_seconds": APPROVAL_TIMEOUT, "on_timeout": "deny", "approvers": None}
+
+    def shadow_for(self, source: str | None, client: str) -> bool:
+        """Shadow mode: record what would happen, but let it through (everything, or the agents listed)."""
+        self._maybe_reload()
+        if self.mode == "shadow":
+            return True
+        return any(fnmatch.fnmatchcase((k or "").lower(), g.lower()) for g in self.shadow_agents for k in (source, client))
 
     def evaluate(self, *, kind: str, name: str, source: str | None, client: str,
                  session_id: str | None, input: Any) -> tuple[str, str, str | None, dict]:
         """-> (action, reason, rule_id, rule). `rule` carries the review options."""
         self._maybe_reload()
         values = {"kind": kind, "name": name, "source": source, "client": client, "session_id": session_id}
-        input_text: str | None = None
+        input_text = input if isinstance(input, str) else json.dumps(input, default=str, ensure_ascii=False)
         for rule in self.rules:
-            if not all(
-                any(fnmatch.fnmatchcase((values[f] or "").lower(), p.lower()) for p in pats)
-                for f, pats in rule["globs"].items()
-            ):
-                continue
-            if rule["input_regex"] is not None:
-                if input_text is None:
-                    input_text = input if isinstance(input, str) else json.dumps(input, default=str, ensure_ascii=False)
-                if not rule["input_regex"].search(input_text):
-                    continue
-            # A missing or non-numeric field never matches, so the call falls through to later rules.
-            if not all((n := self._input_number(input, f)) is not None and op(n, v) for f, op, v in rule["input_conds"]):
-                continue
-            return rule["action"], rule["reason"] or f"matched rule {rule['id']}", rule["id"], rule
+            if self.matches(rule, values, input, input_text):
+                return rule["action"], rule["reason"] or f"matched rule {rule['id']}", rule["id"], rule
         return self.default, self.default_reason, None, self.DEFAULT_RULE
 
 
@@ -654,6 +784,7 @@ class Decision(BaseModel):
     decided_by: str | None = None
     decision_note: str | None = None
     signals: list[dict] | None = None  # history-check findings, e.g. possible impersonation
+    would: str | None = None           # shadow mode: deny | review that was let through
 
 
 class ApprovalIn(BaseModel):
@@ -663,14 +794,16 @@ class ApprovalIn(BaseModel):
 # --------------------------------------------------------------------------- core
 
 
-def stopped_for(source: str | None, client: str) -> dict | None:
-    """The emergency stop that applies to this caller, if any: everything, or one agent (by source or key)."""
-    s = state_get("stop", {"all": None, "agents": {}})
+def stopped_for(source: str | None, client: str, session_id: str | None = None) -> dict | None:
+    """The stop that applies to this caller, if any: everything, one agent (by source or key), or one session."""
+    s = state_get("stop", {"all": None, "agents": {}, "sessions": {}})
     if s.get("all"):
         return s["all"]
     for k in (source, client):
         if k and k in s.get("agents", {}):
             return s["agents"][k]
+    if session_id and session_id in s.get("sessions", {}):
+        return {**s["sessions"][session_id], "session": session_id}
     return None
 
 
@@ -763,7 +896,8 @@ def _message_behind(prior: list, input: Any) -> tuple[str, str] | None:
 
 
 def history_signals(conn, name: str, input: Any, stored_input: str | None, source: str | None,
-                    session_id: str | None, is_change: bool) -> list[dict]:
+                    session_id: str | None, is_change: bool, client: str | None = None,
+                    only_reads: bool = False) -> list[dict]:
     """Look at what happened before this action (see HISTORY_DEFAULTS)."""
     hc = policy.history
     if all(hc[k] == "off" for k in HISTORY_EFFECT_KEYS):
@@ -774,11 +908,13 @@ def history_signals(conn, name: str, input: Any, stored_input: str | None, sourc
     add = lambda check, message, ref=None: hc[check] != "off" and out.append(
         {"check": check, "effect": hc[check], "message": message, "ref": ref})
 
-    # 1. A person already said no to this.
-    if hc["repeat_of_rejected"] != "off":
+    # 1. A person already said no to this - to this agent. (Looking again, e.g. `git status`, is not a retry.)
+    if hc["repeat_of_rejected"] != "off" and not only_reads:
+        same_agent = and_(events.c.source == source if source else events.c.source.is_(None),
+                          events.c.client == client if client else true())
         rejected = conn.execute(select(events).where(
             events.c.name == name, events.c.decision == "deny", events.c.decided_by.isnot(None),
-            events.c.decided_by != "timeout", events.c.created_at >= since,
+            events.c.decided_by != "timeout", events.c.created_at >= since, same_agent,
         ).order_by(events.c.created_at.desc()).limit(50)).all()
         for r in rejected:
             prev_target = _target(json.loads(r.input)) if r.input else None
@@ -824,26 +960,203 @@ def history_signals(conn, name: str, input: Any, stored_input: str | None, sourc
     return out
 
 
+def command_signals(name: str, input: Any) -> tuple[list[dict], bool]:
+    """What a shell tool's command actually does (commands.py). -> (signals, only_reads)."""
+    cc = policy.commands
+    if not any(fnmatch.fnmatchcase(name.lower(), t.lower()) for t in cc["tools"]):
+        return [], False
+    line = commands.command_of(input)
+    if not line:
+        return [], False
+    reading = commands.read(line)
+    kind = reading.kind
+    if kind in COMMAND_EFFECT_KEYS:
+        if cc[kind] == "off":
+            return [], False
+        return [{"check": f"{kind}_command", "effect": cc[kind], "message": f"This command {reading.summary()}."}], False
+    return [], kind == "read_only"
+
+
+SEQUENCE_EFFECT = {"deny": "block", "review": "review", "warn": "warn"}
+_recorded_policies: set[str] = set()
+
+
+def record_policy_version(conn) -> None:
+    """Keep the text of each rules.yaml version that decides something (inside audited_tx, so no two race)."""
+    fp = policy.fingerprint
+    if fp in _recorded_policies:
+        return
+    if conn.execute(select(policy_versions.c.fingerprint).where(policy_versions.c.fingerprint == fp)).first() is None:
+        conn.execute(policy_versions.insert().values(fingerprint=fp, first_seen=utcnow(), content=policy.source))
+        audit(conn, "gateway", "policy.version", fp, sha256=hashlib.sha256(policy.source.encode()).hexdigest(),
+              rules=len(policy.rules), sequences=len(policy.sequences))
+    _recorded_policies.add(fp)
+
+
+def _step_phrase(row) -> str:
+    """How an earlier step reads in a reason: Bash `aws rds modify-db-instance ...` (12 minutes ago)."""
+    stored = json.loads(row.input) if row.input else None
+    line = commands.command_of(stored) if stored is not None else None
+    target = _target(stored) if stored is not None else None
+    detail = f" `{line[:90]}`" if line else f" on {target[1]}" if target else ""
+    return f"{row.name}{detail} ({_ago(row.created_at)})"
+
+
+def sequence_signals(conn, ev: "EventIn", client: str) -> list[dict]:
+    """rules.yaml `sequences:` - this action, judged by what came before it (see rules.yaml)."""
+    seqs = policy.sequences
+    if not seqs:
+        return []
+    values = {"kind": ev.kind, "name": ev.name, "source": ev.source, "client": client, "session_id": ev.session_id}
+    input_text = ev.input if isinstance(ev.input, str) else json.dumps(ev.input, default=str, ensure_ascii=False)
+    out: list[dict] = []
+    now = datetime.now(timezone.utc)
+    for seq in seqs:
+        if not Policy.matches(seq["match"], values, ev.input, input_text):
+            continue
+        earlier = lambda hours, scope: conn.execute(select(events).where(
+            scope, events.c.created_at >= (now - timedelta(hours=hours)).isoformat().replace("+00:00", "Z"))
+            .order_by(events.c.created_at.desc()).limit(500)).all()
+        row_values = lambda r: {"kind": r.kind, "name": r.name, "source": r.source, "client": r.client,
+                                "session_id": r.session_id}
+        stored = lambda r: json.loads(r.input) if r.input else None
+        message = None
+        if seq["after"]:
+            a = seq["after"]
+            scope = events.c.session_id == ev.session_id if ev.session_id else and_(events.c.source == ev.source,
+                                                                                    events.c.client == client)
+            target = _target(ev.input)
+            for r in earlier(a["within_hours"], scope):
+                if r.status not in ("completed", "pending"):      # only steps that actually went ahead
+                    continue
+                if not Policy.matches(a["match"], row_values(r), stored(r), r.input or ""):
+                    continue
+                prev = _target(stored(r))
+                if a["same_target"] and not (target and prev and prev[1].lower() == target[1].lower()):
+                    continue
+                message, ref = f"{seq['reason']}. Because earlier: {_step_phrase(r)}.", r.id
+                break
+        if seq["count"] and message is None:
+            c = seq["count"]
+            scope = {"session": events.c.session_id == ev.session_id if ev.session_id else events.c.source == ev.source,
+                     "agent": and_(events.c.source == ev.source, events.c.client == client),
+                     "all": events.c.id.isnot(None)}[c["scope"]]
+            hits = [r for r in earlier(c["within_hours"], scope)
+                    if r.status != "denied" and Policy.matches(seq["match"], row_values(r), stored(r), r.input or "")]
+            if len(hits) >= c["more_than"]:
+                span = f"{c['within_hours']:g} hour{'s' if c['within_hours'] != 1 else ''}"
+                who = {"session": "in this conversation", "agent": "by this agent", "all": "across all agents"}[c["scope"]]
+                message = (f"{seq['reason']}. Because {len(hits)} like it ran {who} in the last {span} "
+                           f"(limit {c['more_than']}); the latest: {_step_phrase(hits[0])}.")
+                ref = hits[0].id
+        if message:
+            out.append({"check": "sequence", "rule": seq["id"], "effect": SEQUENCE_EFFECT[seq["action"]],
+                        "message": message, "ref": ref})
+    return out
+
+
+def _globbed(name: str | None, globs: list[str]) -> bool:
+    return any(fnmatch.fnmatchcase((name or "").lower(), g.lower()) for g in globs)
+
+
+def taint_signals(conn, ev: "EventIn", client: str) -> list[dict]:
+    """Does this action send something to a destination that only untrusted content mentioned? (see taint.py)"""
+    tc = policy.taint
+    if tc["untrusted_destination"] == "off" and tc["after_untrusted"] == "off":
+        return []
+    shell = _globbed(ev.name, policy.commands["tools"])
+    line = commands.command_of(ev.input) if shell else None
+    if shell:
+        if not taint.sends_out(line):
+            return []
+    elif not _globbed(ev.name, tc["sinks"]):     # e.g. github.create_pull_request: a sink, even though "*pull_request*" reads
+        return []
+    since = (datetime.now(timezone.utc) - timedelta(hours=float(tc["lookback_hours"]))).isoformat().replace("+00:00", "Z")
+    scope = events.c.session_id == ev.session_id if ev.session_id else and_(events.c.source == ev.source,
+                                                                            events.c.client == client)
+    rows = conn.execute(select(events.c.id, events.c.name, events.c.kind, events.c.input, events.c.output,
+                               events.c.created_at).where(scope, events.c.created_at >= since)
+                        .order_by(events.c.created_at.desc()).limit(300)).all()
+
+    def untrusted(r) -> bool:
+        if r.kind == "prompt":
+            return False
+        if _globbed(r.name, policy.commands["tools"]):        # a shell command that fetched something from outside
+            cmd = commands.command_of(json.loads(r.input)) if r.input else None
+            return bool(cmd and taint.UPLOAD_RE.search(cmd) and not taint.sends_out(cmd))
+        return _globbed(r.name, tc["untrusted"])
+
+    outside = [r for r in rows if r.output and untrusted(r)]
+    if not outside:
+        return []
+    trusted = [r.input for r in rows if r.kind == "prompt" and r.input] + \
+              [r.output for r in rows if r.output and r.kind != "prompt" and not untrusted(r)]
+    out: list[dict] = []
+    if tc["untrusted_destination"] != "off":
+        for dest in taint.destinations(ev.input, line):
+            if taint.own_domain(dest, policy.history["company_domains"]):
+                continue
+            hit = next((r for r in outside if taint.appears_in(dest, r.output)), None)
+            if hit and not any(taint.appears_in(dest, t) for t in trusted):
+                out.append({"check": "untrusted_destination", "effect": tc["untrusted_destination"], "ref": hit.id,
+                            "message": f"This sends to {dest['value']} ({dest['field']}), which appears in {hit.name} "
+                                       f"({_ago(hit.created_at)}) but not in anything you asked or in your own systems. "
+                                       "Content from outside can carry hidden instructions (prompt injection)."})
+                break
+    if not out and tc["after_untrusted"] != "off":
+        names = list(dict.fromkeys(r.name for r in outside))
+        out.append({"check": "after_untrusted", "effect": tc["after_untrusted"], "ref": outside[0].id,
+                    "message": f"Earlier in this conversation the agent read content from outside "
+                               f"({', '.join(names[:3])}{'...' if len(names) > 3 else ''}), and this sends something out. "
+                               "Check it's what you asked for."})
+    return out
+
+
 def record_event(ev: EventIn, client: str, client_ip: str | None) -> Decision:
     signals: list[dict] = []
-    if stop := stopped_for(ev.source, client):
-        decision, rule_id, rule = "deny", "emergency-stop", policy.DEFAULT_RULE
-        reason = f"Emergency stop by {stop['by']}" + (f": {stop['reason']}" if stop.get("reason") else "")
+    if stop := stopped_for(ev.source, client, ev.session_id):
+        decision, rule = "deny", policy.DEFAULT_RULE
+        rule_id = "session-stop" if stop.get("session") else "emergency-stop"
+        reason = (f"This session was stopped by {stop['by']}" if stop.get("session") else f"Emergency stop by {stop['by']}")             + (f": {stop['reason']}" if stop.get("reason") else "")
     else:
         # Policy sees the raw input; storage only ever sees the redacted copy.
         decision, reason, rule_id, rule = policy.evaluate(
             kind=ev.kind, name=ev.name, source=ev.source, client=client, session_id=ev.session_id, input=ev.input
         )
         if decision != "deny":
+            command_found, only_reads = command_signals(ev.name, ev.input)
             with engine.connect() as conn:
-                signals = history_signals(conn, ev.name, ev.input, to_stored_json(ev.input), ev.source,
-                                          ev.session_id, is_change=decision == "review")
+                # Most telling first: a sequence names the step that caused it; history checks are specific to
+                # the business (who asked for this payment); taint and command checks are more general.
+                signals = sequence_signals(conn, ev, client)
+                # A command that only looks isn't a change: running `git status` twice is not a duplicate.
+                signals += history_signals(conn, ev.name, ev.input, to_stored_json(ev.input), ev.source,
+                                           ev.session_id, is_change=decision == "review" and not only_reads,
+                                           client=client, only_reads=only_reads)
+                signals += taint_signals(conn, ev, client) + command_found
             blocking = next((s for s in signals if s["effect"] == "block"), None)
             needs_person = next((s for s in signals if s["effect"] == "review"), None)
+            signal_id = lambda s: f"sequence:{s['rule']}" if s["check"] == "sequence" else \
+                f"command:{s['check']}" if s["check"].endswith("_command") else \
+                f"taint:{s['check']}" if s["check"] in TAINT_EFFECT_KEYS else f"history:{s['check']}"
             if blocking and ev.output is None and ev.error is None:
-                decision, reason, rule_id = "deny", blocking["message"], f"history:{blocking['check']}"
+                decision, reason, rule_id = "deny", blocking["message"], signal_id(blocking)
             elif needs_person and decision == "allow":
-                decision, reason, rule_id, rule = "review", needs_person["message"], f"history:{needs_person['check']}", policy.DEFAULT_RULE
+                decision, reason, rule_id, rule = "review", needs_person["message"], signal_id(needs_person), policy.DEFAULT_RULE
+            elif needs_person and decision == "review" and rule_id is None:
+                # held by the default anyway: give the approver the specific reason
+                reason, rule_id = needs_person["message"], signal_id(needs_person)
+            elif (only_reads and decision == "review" and rule_id is None and policy.commands["read_only"] == "allow"
+                  and not any(s["effect"] in ("block", "review") for s in signals)):
+                # Nothing matched but the default, and the command only looks: don't make a person approve `ls`.
+                decision, reason, rule_id = "allow", "Only reads (like ls, cat, grep, git status), so it runs without asking", \
+                    "command:read_only"
+    would = None
+    # Shadow mode lets it through but records what would have happened. Stops and catastrophic commands still apply.
+    if decision in ("deny", "review") and rule_id not in ("emergency-stop", "session-stop", "command:catastrophic_command")             and policy.shadow_for(ev.source, client):
+        would = decision
+        reason = f"Shadow mode, allowed. Would have {'been blocked' if decision == 'deny' else 'waited for approval'}: {reason}"
+        decision = "allow"
     already_ran = ev.error is not None or ev.output is not None
     if decision == "review" and already_ran:
         # A record-only event has already happened; there is nothing left to approve.
@@ -875,19 +1188,21 @@ def record_event(ev: EventIn, client: str, client_ip: str | None) -> Decision:
         "approval_on_timeout": rule["on_timeout"] if deadline else None,
         "approvers": json.dumps(rule["approvers"]) if deadline and rule["approvers"] else None,
         "signals": json.dumps(signals) if signals else None,
+        "would": would,
     }
     with audited_tx() as conn:
+        record_policy_version(conn)
         conn.execute(events.insert().values(**row))
-        audit(conn, client, "event.created", row["id"], name=ev.name, kind=ev.kind, source=ev.source,
+        audit(conn, client, "event.created", row["id"], rules=policy.fingerprint, name=ev.name, kind=ev.kind, source=ev.source,
               session_id=ev.session_id, status=status, decision=decision, rule_id=rule_id, reason=reason,
               input_sha256=_sha(row["input"]), output_sha256=_sha(row["output"]),
-              signals=[f"{x['check']}:{x['effect']}" for x in signals] or None)
+              signals=[f"{x['check']}:{x['effect']}" for x in signals] or None, would=would)
     audit_log.info(json.dumps({k: row[k] for k in ("id", "created_at", "client", "source", "session_id",
                                                     "kind", "name", "status", "rule_id")}))
     if status == "awaiting_approval":
         notify_approval_needed(row)
     return Decision(event_id=row["id"], decision=decision, reason=reason, rule_id=rule_id,
-                    status=status, approval_deadline=deadline, signals=signals or None)
+                    status=status, approval_deadline=deadline, signals=signals or None, would=would)
 
 
 # --------------------------------------------------------------------------- notifications + approval links
@@ -1265,7 +1580,8 @@ def reject(event_id: str, body: ApprovalIn | None = None, who: str = Depends(aut
 def me(who: str = Depends(auth)):
     i = keystore.info(who)
     return {"client": who, "kind": i["kind"], "roles": i["roles"], "is_admin": keystore.is_admin(who),
-            "can_approve": can_approve(who), "auth_enabled": keystore.enabled}
+            "can_approve": can_approve(who), "auth_enabled": keystore.enabled,
+            "mode": policy.mode, "shadow_agents": policy.shadow_agents}
 
 
 @app.get("/v1/me/phone-link")
@@ -1340,6 +1656,7 @@ def team_remove(name: str, who: str = Depends(admin)):
 
 class StopIn(BaseModel):
     agent: str | None = Field(None, description="an agent's source or key name; omit to stop everything")
+    session: str | None = Field(None, max_length=200, description="stop just this session (one conversation)")
     reason: str | None = Field(None, max_length=500)
 
 
@@ -1354,16 +1671,27 @@ def controls_stop(body: StopIn, who: str = Depends(person)):
     if not (can_approve(who) or keystore.is_admin(who)):
         raise HTTPException(403, "only approvers and admins can stop agents")
     entry = {"by": who, "at": utcnow(), "reason": body.reason}
+    target = f"session:{body.session}" if body.session else body.agent or "*"
     with audited_tx() as conn:
         s = json.loads(conn.execute(select(gateway_state.c.value).where(gateway_state.c.key == "stop")).scalar()
                        or '{"all": null, "agents": {}}')
-        if body.agent:
+        if body.session:
+            s.setdefault("sessions", {})[body.session] = entry
+            # Anything still waiting in that session is rejected: nobody should approve half of a stopped run.
+            waiting = conn.execute(select(events.c.id).where(events.c.session_id == body.session,
+                                                             events.c.status == "awaiting_approval")).all()
+            note = "The session was stopped" + (f": {body.reason}" if body.reason else "")
+            for (eid,) in waiting:
+                if conn.execute(update(events).where(events.c.id == eid, events.c.status == "awaiting_approval").values(
+                        status="denied", decision="deny", decided_by=who, decided_at=utcnow(), decision_note=note)).rowcount:
+                    audit(conn, who, "event.rejected", eid, note=note, via="session-stop")
+        elif body.agent:
             s.setdefault("agents", {})[body.agent] = entry
         else:
             s["all"] = entry
         state_set(conn, "stop", s)
-        audit(conn, who, "controls.stopped", body.agent or "*", reason=body.reason)
-    log.warning("EMERGENCY STOP (%s) by %s: %s", body.agent or "all agents", who, body.reason)
+        audit(conn, who, "controls.stopped", target, reason=body.reason)
+    log.warning("STOP (%s) by %s: %s", target if target != "*" else "all agents", who, body.reason)
     return s
 
 
@@ -1372,12 +1700,14 @@ def controls_resume(body: StopIn, who: str = Depends(admin)):
     with audited_tx() as conn:
         s = json.loads(conn.execute(select(gateway_state.c.value).where(gateway_state.c.key == "stop")).scalar()
                        or '{"all": null, "agents": {}}')
-        if body.agent:
+        if body.session:
+            s.setdefault("sessions", {}).pop(body.session, None)
+        elif body.agent:
             s.setdefault("agents", {}).pop(body.agent, None)
         else:
             s["all"] = None
         state_set(conn, "stop", s)
-        audit(conn, who, "controls.resumed", body.agent or "*")
+        audit(conn, who, "controls.resumed", f"session:{body.session}" if body.session else body.agent or "*")
     return s
 
 
@@ -1474,7 +1804,8 @@ def event_context(row, limit: int = 15) -> list[dict]:
         start = (datetime.fromisoformat(row.created_at.replace("Z", "+00:00")) - timedelta(hours=1)).isoformat().replace("+00:00", "Z")
         scope = and_(events.c.source == row.source, events.c.created_at >= start)
     with engine.connect() as conn:
-        rows = conn.execute(select(events).where(scope, events.c.created_at < row.created_at, events.c.id != row.id)
+        # <= : created_at is millisecond-precise, so a step taken in the same millisecond still counts as "before".
+        rows = conn.execute(select(events).where(scope, events.c.created_at <= row.created_at, events.c.id != row.id)
                             .order_by(events.c.created_at.desc()).limit(limit)).all()
     return [{"id": r.id, "created_at": r.created_at, "name": r.name, "status": r.status, "decision": r.decision,
              "input": json.loads(r.input) if r.input else None, "output": _output_preview(r.output),
@@ -1529,6 +1860,8 @@ def build_report(days: int) -> dict:
             count_if(human & (events.c.decision == "allow")).label("approved"),
             count_if(human & (events.c.decision == "deny")).label("rejected"),
             count_if(events.c.status == "failed").label("failed"),
+            count_if(events.c.would == "deny").label("would_block"),
+            count_if(events.c.would == "review").label("would_hold"),
             func.max(events.c.created_at).label("last_seen"),
         ).where(in_period).group_by(agent).order_by(text("total DESC")))]
         blocked = [dict(r._mapping) for r in conn.execute(select(
@@ -1559,6 +1892,9 @@ def build_report(days: int) -> dict:
     return {"generated_at": utcnow(), "days": days, "since": since, "total": sum(by_status.values()),
             "by_status": by_status, "agents": agents, "approvals": approvals, "blocked_by_rule": blocked,
             "top_tools": top_tools, "controls": state_get("stop", {"all": None, "agents": {}}),
+            "shadow": {"mode": policy.mode, "agents": policy.shadow_agents,
+                       "would_block": sum(a["would_block"] or 0 for a in agents),
+                       "would_hold": sum(a["would_hold"] or 0 for a in agents)},
             "audit": verify_audit_chain()}
 
 
@@ -1572,6 +1908,24 @@ def audit_verify(_: str = Depends(person)):
     return verify_audit_chain()
 
 
+@app.get("/v1/audit/export.json")
+def audit_evidence(who: str = Depends(person)):
+    """Everything needed to check the history offline: python verify.py <file> (see verify.py)."""
+    with audited_tx() as conn:
+        audit(conn, who, "audit.exported", None, format="evidence")
+    with engine.connect() as conn:
+        entries = [dict(r._mapping) for r in conn.execute(select(audit_trail).order_by(audit_trail.c.seq)).all()]
+        evs = [dict(r._mapping) for r in conn.execute(select(*[events.c[c] for c in EXPORT_COLUMNS])
+                                                      .order_by(events.c.created_at)).all()]
+        policies = {r.fingerprint: r.content for r in conn.execute(select(policy_versions)).all()}
+    body = {"format": verify.FORMAT, "generated_at": utcnow(), "generated_by": who,
+            "head_hash": entries[-1]["hash"] if entries else GENESIS, "entries": entries, "events": evs,
+            "policies": policies,
+            "how_to_check": "python verify.py this-file.json   (verify.py is in the Squidbrake repository)"}
+    return Response(json.dumps(body, ensure_ascii=False, indent=1), media_type="application/json", headers={
+        "Content-Disposition": f'attachment; filename="squidbrake-evidence-{datetime.now():%Y%m%d-%H%M}.json"'})
+
+
 @app.get("/v1/audit/log")
 def audit_entries(limit: int = Query(100, ge=1, le=1000), _: str = Depends(person)):
     with engine.connect() as conn:
@@ -1581,7 +1935,7 @@ def audit_entries(limit: int = Query(100, ge=1, le=1000), _: str = Depends(perso
 
 EXPORT_COLUMNS = ["created_at", "id", "source", "client", "session_id", "kind", "name", "status", "decision",
                   "rule_id", "reason", "decided_by", "decided_at", "decision_note", "completed_at", "duration_ms",
-                  "error", "input", "output"]
+                  "error", "input", "output", "would"]
 
 
 @app.get("/v1/audit/export.csv")
@@ -1820,14 +2174,14 @@ async def proxy(upstream: str, path: str, request: Request, client: str = Depend
 
 # --------------------------------------------------------------------------- command line
 
-CLI = "docker compose exec gateway python server.py" if IN_DOCKER else "python server.py"
+CLI = os.getenv("SQUIDBRAKE_CLI") or ("docker compose exec gateway python server.py" if IN_DOCKER else "python server.py")
 
 
 def print_banner(url: str | None, created: dict[str, str] | None) -> None:
     bar = "=" * 72
     lines = ["", bar, "  Squidbrake is running" if url else "  Squidbrake"]
     if url:
-        lines += [f"  Dashboard:  {url}/dashboard"]
+        lines += [f"  Dashboard:  {url}/dashboard", f"  Rules:      {RULES_PATH}   (edit it; changes apply at once)"]
     if created:
         lines += [
             "",
@@ -1912,7 +2266,7 @@ def _cli_run(args) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
-    p = argparse.ArgumentParser(prog="server.py", description="Squidbrake. With no command, starts the server.")
+    p = argparse.ArgumentParser(prog="squidbrake" if CLI == "squidbrake" else "server.py", description="Squidbrake. With no command, starts the server.")
     sub = p.add_subparsers(dest="cmd", metavar="COMMAND")
     r = sub.add_parser("run", help="start the server (default)")
     r.add_argument("--host", default=os.getenv("HOST", "127.0.0.1"),
@@ -1929,12 +2283,14 @@ def main(argv: list[str] | None = None) -> int:
     rm = sub.add_parser("remove-key", help="revoke a key")
     rm.add_argument("name")
     sub.add_parser("keys", help="list keys")
+    v = sub.add_parser("verify", help="check an evidence file offline (same as: python verify.py FILE)")
+    v.add_argument("file")
     argv = sys.argv[1:] if argv is None else argv
     if not argv or (argv[0].startswith("-") and argv[0] not in ("-h", "--help")):
         argv = ["run", *argv]  # `python server.py --port 9000` means run
     args = p.parse_args(argv)
-    return {"run": _cli_run, "init": _cli_init, "add-key": _cli_add_key,
-            "remove-key": _cli_remove_key, "keys": _cli_keys}[args.cmd](args)
+    return {"run": _cli_run, "init": _cli_init, "add-key": _cli_add_key, "remove-key": _cli_remove_key,
+            "keys": _cli_keys, "verify": lambda a: verify.main([a.file])}[args.cmd](args)
 
 
 if __name__ == "__main__":

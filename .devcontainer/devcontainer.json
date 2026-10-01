@@ -1,13 +1,14 @@
 {
   "name": "Squidbrake live demo",
   "image": "mcr.microsoft.com/devcontainers/python:3.12",
-  "postCreateCommand": "pip install --user -r requirements.txt",
-  "postAttachCommand": { "demo": "python demo/live_demo.py" },
+  "postCreateCommand": "pip install --user -q -r requirements.txt",
+  "waitFor": "postCreateCommand",
   "forwardPorts": [8090],
   "portsAttributes": {
     "8090": { "label": "Squidbrake demo", "onAutoForward": "openBrowser" }
   },
   "customizations": {
-    "codespaces": { "openFiles": ["SHOWCASE.md"] }
+    "codespaces": { "openFiles": ["SHOWCASE.md"] },
+    "vscode": { "settings": { "task.allowAutomaticTasks": "on" } }
   }
 }

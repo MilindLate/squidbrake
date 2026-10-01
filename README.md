@@ -1,11 +1,12 @@
 # Squidbrake
 
 [![tests](https://github.com/batrapulkit/squidbrake/actions/workflows/tests.yml/badge.svg)](https://github.com/batrapulkit/squidbrake/actions/workflows/tests.yml)
+[![PyPI](https://img.shields.io/pypi/v/squidbrake.svg)](https://pypi.org/project/squidbrake/)
 [![License: Apache 2.0](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](LICENSE)
 [![Python 3.10+](https://img.shields.io/badge/python-3.10%2B-blue.svg)](requirements.txt)
 [![MCP](https://img.shields.io/badge/MCP-compatible-8A2BE2.svg)](#2-connect-real-agents)
 
-![Demo: an AI agent's scam wire is blocked, a refund waits for approval and is approved from a phone](docs/demo.gif)
+![Demo: an AI agent's scam wire is blocked, a refund waits for approval and is approved from a phone](https://raw.githubusercontent.com/batrapulkit/squidbrake/main/docs/demo.gif)
 
 **Brakes for your AI agents.** Every action an agent takes (running a command, editing a file, sending an
 email, issuing a refund, changing a database) goes through Squidbrake first. It is **checked** against your
@@ -18,22 +19,31 @@ Free and open source (Apache 2.0). Runs on your laptop or your own server; your 
   No LLM in the decision path.
 - **Human approval:** risky actions wait in the dashboard, on your phone (one-tap links, push via ntfy) or in Slack.
   The approver sees *what led to it*, e.g. the email the agent just read.
+- **Reads what a command really does:** `ls && rm -rf ~/`, `bash -c "..."`, `rmdir /s /q d:\` or `curl ... | sh` are
+  split and read before they run. Wiping a disk or home folder is blocked; `git push --force`, `terraform destroy`,
+  `kubectl delete` or cloud deletes wait for a person; commands that only look (`ls`, `git status`) run without asking.
+- **Catches prompt injection without a model:** if an agent sends data to an address that only a web page, email or
+  issue mentioned (not you, not your own systems), it's held and the approver is told where the address came from.
 - **Judges by history:** blocks a retry of something a person rejected, catches look-alike domains
-  (`acrne-corp.com` pretending to be `acme.com`), flags duplicate refunds.
+  (`acrne-corp.com` pretending to be `acme.com`), flags duplicate refunds, and lets you write sequence rules
+  ("deleting a database right after its backups were turned off") that say which earlier step caused them.
 - **Works with real agents:** one command connects Claude Code (every tool call, via hooks), and any MCP app
   (Stripe, GitHub, Slack, databases, internal tools) can be wrapped for Antigravity, Cursor, Claude Desktop and others.
-- **For teams:** a key per person and per agent, roles (only `finance` approves wires), an emergency stop,
-  reports, CSV export and an audit trail you can verify.
+- **For teams:** a key per person and per agent, roles (only `finance` approves wires), an emergency stop (all agents,
+  one agent, or one conversation, which also ends Claude Code's turn),
+  reports, CSV export, and evidence anyone can verify offline (`python verify.py`).
 - **Fails closed:** if Squidbrake is down, guarded tools don't run.
 
-See [SHOWCASE.md](SHOWCASE.md) for a 5-minute demo with a sandbox company.
+See [SHOWCASE.md](SHOWCASE.md) for a 5-minute demo with a sandbox company, and [incidents/](incidents/) for **8 real
+AI-agent incidents replayed against the shipped rules** (Replit, the Railway volume deletion, GitHub MCP, Supabase
+MCP, Claude Code and Antigravity deletes...): 11 of 11 harmful actions stopped, checked in CI.
 
-![Squidbrake dashboard: a git push and a refund wait for approval, while a scam wire transfer was blocked](docs/dashboard.png)
+![Squidbrake dashboard: a git push and a refund wait for approval, while a scam wire transfer was blocked](https://raw.githubusercontent.com/batrapulkit/squidbrake/main/docs/dashboard.png)
 
 <table><tr>
-<td width="62%"><img src="docs/blocked-scam.png" alt="A $24,800 wire blocked because it follows an email from a look-alike domain"><br>
+<td width="62%"><img src="https://raw.githubusercontent.com/batrapulkit/squidbrake/main/docs/blocked-scam.png" alt="A $24,800 wire blocked because it follows an email from a look-alike domain"><br>
 <sub>An agent read an "urgent CEO" email from <code>acrne-corp.com</code> and tried to wire $24,800. Blocked, with the story of what led to it.</sub></td>
-<td width="38%"><img src="docs/phone-approval.png" alt="One-tap approval on a phone"><br>
+<td width="38%"><img src="https://raw.githubusercontent.com/batrapulkit/squidbrake/main/docs/phone-approval.png" alt="One-tap approval on a phone"><br>
 <sub>Approve or reject from your phone with one tap.</sub></td>
 </tr></table>
 
@@ -43,21 +53,29 @@ See [SHOWCASE.md](SHOWCASE.md) for a 5-minute demo with a sandbox company.
 
 Click the button and the live demo starts in your browser (free with a GitHub account): a sandbox company's AI
 support agent works its inbox while you watch. A scam wire is blocked, refunds wait for a person, and a demo
-manager approves or rejects them. On your own machine: `pip install -r requirements.txt` then `python demo/live_demo.py`.
+manager approves or rejects them. If the editor asks whether to allow tasks that run automatically, click
+**Allow**: that's the demo starting. On your own machine: `pip install -r requirements.txt` then `python demo/live_demo.py`.
 
 ## Try it in 30 seconds
 
 ```bash
-git clone https://github.com/batrapulkit/squidbrake && cd squidbrake
-./start.sh          # Windows: start.bat
+pipx install squidbrake           # or: pip install squidbrake
+squidbrake                        # prints your keys and opens the dashboard
 ```
 
-It installs itself, prints your keys and opens the dashboard. Then connect Claude Code (every tool call goes
-through Squidbrake from then on):
+Then connect Claude Code, so every tool call goes through Squidbrake from then on. Either as a plugin, from inside
+Claude Code (it asks for the agent key the gateway printed; see [plugin/](plugin/)):
 
-```bash
-./connect.sh claude-code          # Windows: connect.bat claude-code
 ```
+/plugin marketplace add batrapulkit/squidbrake
+/plugin install squidbrake@squidbrake
+```
+
+or from the terminal: `squidbrake connect claude-code`. Your rules, keys and data live in `~/.squidbrake`;
+edit `~/.squidbrake/rules.yaml` and changes apply at once.
+
+From a clone instead: `git clone https://github.com/batrapulkit/squidbrake && cd squidbrake`, then `./start.sh`
+(Windows: `start.bat`) and `./connect.sh claude-code` (Windows: `connect.bat claude-code`).
 
 Or with Docker: `docker run -d -p 8080:8080 -v squidbrake-data:/app/data --name squidbrake ghcr.io/batrapulkit/squidbrake`
 (keys: `docker logs squidbrake`).
@@ -79,7 +97,8 @@ Changes apply immediately, no restart needed. (Inside Docker, prefix with `docke
 
 ## 2. Connect real agents
 
-With the gateway running, one command per agent (use the `.venv` Python that `start.bat` / `start.sh` created):
+With the gateway running, one command per agent (installed with pip, type `squidbrake connect ...` instead;
+from a clone, use the `.venv` Python that `start.bat` / `start.sh` created):
 
 ```bash
 .venv/Scripts/python connect.py claude-code          # Windows (macOS/Linux: .venv/bin/python)
@@ -95,6 +114,9 @@ With the gateway running, one command per agent (use the `.venv` Python that `st
   gets `list_tables`, `describe_table`, `query` and `execute` tools on a SQLite database
   (`data/shop.db`, created with sample customers / products / orders; set `DB_PATH` to use your own).
   Reads run immediately, `UPDATE`/`DELETE`/`INSERT`/`ALTER` wait for your approval, and `DROP`/`TRUNCATE` are blocked.
+
+Wrapping a GitHub or Stripe MCP server? Start with the commented example policies in
+[`examples/rules/`](examples/rules/) and adjust their tool-name patterns to the server's tool list.
 
 Things to ask the agent, then watch the dashboard:
 
@@ -147,6 +169,69 @@ Record an action that already happened in one call by including `output`/`error`
 **HTTP proxy** - no code changes: define `upstreams` in `rules.yaml`, then point the client at
 `http://gateway:8080/proxy/<upstream>/...`. Optional headers: `X-Gateway-Source`, `X-Gateway-Session`.
 Denied requests get `403`; every response carries `X-Gateway-Event-Id`.
+
+## Try it on real work first: shadow mode
+
+Set `mode: shadow` in `rules.yaml` (or `shadow_agents: ["new-bot*"]` for some agents) and Squidbrake blocks and holds
+nothing: it records what it *would* have done. Reports then shows **would block** and **would hold** counts, and each
+event is tagged, so a team can see a week of real decisions before switching `mode: enforce` on. Stops and
+catastrophic commands (`rm -rf /`, wiping a drive) are enforced even in shadow mode.
+
+## Command checks
+
+Shell tools (Claude Code's `Bash` and `PowerShell`, or any tool matching `command_checks.tools`) are read by
+[`commands.py`](commands.py) before the rules decide: the line is split on `&&`, `;`, `|` (outside quotes), and
+`sudo`, `xargs`, `bash -c`, `powershell -Command` and `$(...)` are looked inside. Nothing is ever run or expanded.
+
+| Kind | Examples | Default |
+|---|---|---|
+| catastrophic | `rm -rf /`, `rm -rf ~`, `rmdir /s /q d:\`, `mkfs`, `dd of=/dev/sda`, `chmod -R 777 /` | block |
+| irreversible | `rm -r`, `git push --force`, `git reset --hard`, `terraform destroy`, `kubectl delete`, `aws ... delete-*`, `DROP TABLE` | review |
+| hidden | `eval`, `curl ... \| sh`, `base64 -d \| bash`, `powershell -EncodedCommand` | review |
+| read_only | `ls`, `cat`, `grep`, `git status` / `log` / `diff` | `allow` in the shipped `rules.yaml` |
+
+Command checks apply even when a rule allows the tool, and `read_only: allow` only relaxes the `default` (never a
+rule or a warning). Configure them under `command_checks:` in `rules.yaml`.
+
+## Prompt injection, caught without a model
+
+The attacks that actually happened to agents (a GitHub issue, a support ticket or a web page telling the agent to send
+data somewhere) share one shape: the destination comes from content someone else wrote. Squidbrake records what you
+ask (Claude Code prompts, via the hook) and which tools bring in outside content (`WebFetch`, inboxes, issues,
+tickets...). When an action sends something to an email address, URL, bank account or repo that appears in that
+outside content but not in what you asked or in your own systems' results, it's held with the reason:
+
+> This sends to keys@evil.io (to), which appears in WebFetch (2 minutes ago) but not in anything you asked or in your
+> own systems. Content from outside can carry hidden instructions (prompt injection).
+
+Uploads from the shell count too (`curl -d @.env https://...`, `scp`, `git push`). Anything sent out after outside
+content was read gets a warning for the approver. Configure it under `taint_checks:` in `rules.yaml`.
+
+## Sequence rules
+
+Some actions are only dangerous because of what came before them. `sequences:` in `rules.yaml` judges an action by
+the steps before it and names the step that caused the decision:
+
+```yaml
+sequences:
+  - id: destroy-after-recovery-removed      # turn off backups, then delete the database
+    action: review
+    reason: Destroying data right after its backups or deletion protection were turned off
+    match: { input_regex: 'delete[-_ ]?db[-_ ]?instance|terraform\s+destroy|drop\s+(table|database)' }
+    after:
+      match: { input_regex: 'backup[-_ ]?retention[-_ ]?period\W{0,4}0|deletion[-_ ]?protection\W{0,4}false' }
+      within_hours: 24
+  - id: runaway-refunds                     # an agent stuck in a loop
+    action: deny
+    reason: Too many refunds in a short time
+    match: { name: ["*refund*"] }
+    count: { more_than: 10, within_hours: 1, scope: agent }
+```
+
+The approver then sees, for example: *Destroying data right after its backups were turned off. Because earlier:
+Bash `aws rds modify-db-instance --backup-retention-period 0` (12 minutes ago).* `after:` looks at steps in the same
+conversation that went ahead (`same_target: true` = on the same charge, file or account); `count:` counts earlier
+matching actions per `session`, `agent` or `all`. Actions: `deny`, `review` or `warn`.
 
 ## Human approval
 
@@ -223,6 +308,20 @@ An agent cannot bypass Squidbrake through tools that are connected to the gatewa
 | `POST /v1/policy/check` | dry-run a call against the rules (not recorded) |
 | `GET /docs` | interactive OpenAPI docs |
 
+## Evidence anyone can check
+
+Every decision is written to a hash-chained audit trail together with the fingerprint of the `rules.yaml` version
+that made it, and each version's text is kept. **Reports > Tamper check > Download evidence** (or
+`GET /v1/audit/export.json`) gives one file that anyone can check on their own machine, without trusting the server:
+
+```bash
+python verify.py squidbrake-evidence-20261001-0930.json
+```
+
+It confirms the chain is unbroken, that every recorded action still matches the fingerprint taken when it happened
+(so rows edited in the database are caught, not just edits to the log), and that every decision's rules version is
+in the file. `verify.py` needs only the Python standard library. The dashboard's tamper check runs the same checks live.
+
 ## Behaviour notes
 
 - **Fail closed**: the Python client refuses to run a tool if the gateway is unreachable
@@ -243,6 +342,18 @@ An agent cannot bypass Squidbrake through tools that are connected to the gatewa
 pip install pytest && pytest -q
 python tests/e2e_business_scenario.py
 ```
+
+## Roadmap
+
+- **Reach checks for AWS** ([#18](https://github.com/batrapulkit/squidbrake/issues/18), [design](docs/design/aws-reach-checks.md)):
+  before an IAM change runs, work out what the agent will be able to reach afterwards, and hold it if that crosses a line
+  (admin roles, production, secrets). Stops an agent from giving itself admin in steps that each look harmless.
+- **An optional risk model that can only escalate** ([#16](https://github.com/batrapulkit/squidbrake/issues/16)): a second
+  opinion that can hold an action, never allow one.
+- **More agents connected in one command**: Cursor install ([#2](https://github.com/batrapulkit/squidbrake/issues/2)),
+  more rule packs like the [GitHub and Stripe ones](examples/rules/).
+
+Tell us what you need most: 👍 or comment on the issues.
 
 ## Contributing, security, license
 
