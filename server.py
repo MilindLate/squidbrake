@@ -1960,7 +1960,7 @@ def audit_export(days: int = Query(30, ge=1, le=3650), who: str = Depends(person
 
 @app.get("/v1/audit/export.jsonl")
 def audit_export_jsonl(days: int = Query(30, ge=1, le=3650), who: str = Depends(person)):
-    import json, io
+    import io
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
     buf = io.StringIO()
     head = verify_audit_chain()
@@ -1980,13 +1980,14 @@ def audit_export_jsonl(days: int = Query(30, ge=1, le=3650), who: str = Depends(
                         row_dict[col] = json.loads(row_dict[col])
                     except ValueError:
                         pass
-            buf.write(json.dumps(row_dict) + "\n")
+            buf.write(json.dumps(row_dict, default=str) + "\n")
     with audited_tx() as conn:
         audit(conn, who, "audit.exported", None, days=days, format="jsonl")
+    # A broken chain has no head hash: say so instead of failing, since that's exactly when someone needs this export.
     return Response(buf.getvalue(), media_type="application/jsonl", headers={
         "Content-Disposition": f'attachment; filename="squidbrake-audit-{datetime.now():%Y%m%d}.jsonl"',
-        "X-Audit-Chain": "verified" if head['ok'] else "broken",
-        "X-Audit-Chain-Head": head['head_hash']
+        "X-Audit-Chain": "verified" if head["ok"] else "broken",
+        "X-Audit-Chain-Head": head.get("head_hash") or "none",
     })
 
 
