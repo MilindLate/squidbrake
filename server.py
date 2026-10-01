@@ -1609,6 +1609,7 @@ def audit_export_jsonl(days: int = Query(30, ge=1, le=3650), who: str = Depends(
     import json, io
     since = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat().replace("+00:00", "Z")
     buf = io.StringIO()
+    head = verify_audit_chain()
 
     def serialize(v):
         if isinstance(v, datetime):
@@ -1619,11 +1620,20 @@ def audit_export_jsonl(days: int = Query(30, ge=1, le=3650), who: str = Depends(
         for r in conn.execute(select(*[events.c[c] for c in EXPORT_COLUMNS]).where(events.c.created_at >= since)
                               .order_by(events.c.created_at)):
             row_dict = {c: serialize(v) for c, v in zip(EXPORT_COLUMNS, r)}
+            for col in ("input", "output"):
+                if row_dict.get(col):
+                    try:
+                        row_dict[col] = json.loads(row_dict[col])
+                    except ValueError:
+                        pass
             buf.write(json.dumps(row_dict) + "\n")
     with audited_tx() as conn:
-        audit(conn, who, "audit.exported.jsonl", None, days=days)
+        audit(conn, who, "audit.exported", None, days=days, format="jsonl")
     return Response(buf.getvalue(), media_type="application/jsonl", headers={
-        "Content-Disposition": f'attachment; filename="squidbrake-audit-{datetime.now():%Y%m%d}.jsonl"'})
+        "Content-Disposition": f'attachment; filename="squidbrake-audit-{datetime.now():%Y%m%d}.jsonl"',
+        "X-Audit-Chain": "verified" if head['ok'] else "broken",
+        "X-Audit-Chain-Head": head['head_hash']
+    })
 
 
 @app.post("/v1/policy/check")

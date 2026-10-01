@@ -438,8 +438,16 @@ def test_reports_and_export(c, org):
     assert r["audit"]["ok"] and "support-bot" in server.digest_text(r)
     csv_text = c.get("/v1/audit/export.csv", headers=org["viewer"]).text
     assert "VERIFIED" in csv_text.splitlines()[0] and "support-bot" in csv_text
-    jsonl_text = c.get("/v1/audit/export.jsonl", headers=org["viewer"]).text
+    jsonl_res = c.get("/v1/audit/export.jsonl", headers=org["viewer"])
+    assert jsonl_res.headers["X-Audit-Chain"] == "verified"
+    jsonl_text = jsonl_res.text
     assert "support-bot" in jsonl_text and len(jsonl_text.splitlines()) > 0
+    import json
+    lines = [json.loads(line) for line in jsonl_text.splitlines()]
+    # Check that input objects are parsed (not strings) if present
+    for line in lines:
+        if line.get("input") is not None:
+            assert isinstance(line["input"], dict)
 
 
 def test_one_tap_links(c, org):
